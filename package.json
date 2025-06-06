@@ -1,0 +1,29 @@
+{
+  "name": "kafka-topic-subscriber",
+  "version": "1.0.0",
+  "description": "Simple node app to subscribe to a Confluent Kafka topic and deserialise an AVRO message using Confluent Schema Registry",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaminjadey/node-kafka-topic-subscriber.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jaminjadey/node-kafka-topic-subscriber/issues"
+  },
+  "homepage": "https://github.com/jaminjadey/node-kafka-topic-subscriber#readme",
+  "dependencies": {
+    "@kafkajs/confluent-schema-registry": "^3.9.0",
+    "avsc": "^5.7.7",
+    "dotenv": "^16.5.0",
+    "kafkajs": "^2.2.4",
+    "kafkajs-snappy": "^1.1.0",
+    "npm": "^11.4.1"
+  }
+}

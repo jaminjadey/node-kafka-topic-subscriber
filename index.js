@@ -1,32 +1,68 @@
 // index.js
-
 require("dotenv").config();
-const { Kafka, logLevel } = require("kafkajs");
+
+const {
+  Kafka,
+  logLevel,
+  CompressionTypes,
+  CompressionCodecs,
+} = require("kafkajs");
 const { SchemaRegistry } = require("@kafkajs/confluent-schema-registry");
-const avro = require("avsc");
-const util = require("util");
+const avro    = require("avsc");
+const util    = require("util");
+const SnappyCodec = require("kafkajs-snappy");
+
+// ─── REGISTER SNAPPY ─────────────────────────────────────────────────────────
+// This replaces KafkaJS’s built-in stub (which throws “not implemented”) with
+// the real Snappy codec from kafkajs-snappy. Do this before you create any
+// producer/consumer instances:
+
+CompressionCodecs[CompressionTypes.Snappy] = SnappyCodec;
+
+// ── Constants ───────────────────────────────────────────────────────
+const CONSUMER_CONFIG = {
+  sessionTimeout: 30000,
+  rebalanceTimeout: 60000,
+  heartbeatInterval: 3000,
+  maxWaitTimeInMs: 60000,
+  retry: {
+    retries: 3,
+    initialRetryTime: 1000,
+    maxRetryTime: 30000
+  }
+};
+
+const MESSAGE_TIMEOUT = 120000; // 2 minutes
 
 // ── Environment Setup ───────────────────────────────────────────────
-const kafkaEndpoint = process.env.KAFKA_ENDPOINT?.trim();
-const kafkaSecret = process.env.KAFKA_SECRET?.trim();
-const kafkaKey = process.env.KAFKA_KEY?.trim();
-const kafkaTopic = process.env.KAFKA_TOPIC?.trim();
-const schemaRegistryUrl = process.env.SCHEMA_REGISTRY_URL?.trim();
-const schemaRegistryKey = process.env.SCHEMA_REGISTRY_KEY?.trim();
-const schemaRegistrySecret = process.env.SCHEMA_REGISTRY_SECRET?.trim();
+const required = {
+  KAFKA_ENDPOINT: process.env.KAFKA_ENDPOINT?.trim(),
+  KAFKA_SECRET: process.env.KAFKA_SECRET?.trim(),
+  KAFKA_KEY: process.env.KAFKA_KEY?.trim(),
+  KAFKA_TOPIC: process.env.KAFKA_TOPIC?.trim(),
+  SCHEMA_REGISTRY_URL: process.env.SCHEMA_REGISTRY_URL?.trim(),
+  SCHEMA_REGISTRY_KEY: process.env.SCHEMA_REGISTRY_KEY?.trim(),
+  SCHEMA_REGISTRY_SECRET: process.env.SCHEMA_REGISTRY_SECRET?.trim(),
+};
 
-if (
-  !kafkaEndpoint ||
-  !kafkaSecret ||
-  !kafkaKey ||
-  !kafkaTopic ||
-  !schemaRegistryUrl ||
-  !schemaRegistryKey ||
-  !schemaRegistrySecret
-) {
-  console.error("❌ Missing or invalid environment variables.");
+const missing = Object.entries(required)
+  .filter(([_, value]) => !value)
+  .map(([key]) => key);
+
+if (missing.length > 0) {
+  console.error(`❌ Missing environment variables: ${missing.join(', ')}`);
   process.exit(1);
 }
+
+const { 
+  KAFKA_ENDPOINT: kafkaEndpoint,
+  KAFKA_SECRET: kafkaSecret,
+  KAFKA_KEY: kafkaKey,
+  KAFKA_TOPIC: kafkaTopic,
+  SCHEMA_REGISTRY_URL: schemaRegistryUrl,
+  SCHEMA_REGISTRY_KEY: schemaRegistryKey,
+  SCHEMA_REGISTRY_SECRET: schemaRegistrySecret
+} = required;
 
 // ── Clients ─────────────────────────────────────────────────────────
 const kafka = new Kafka({
@@ -54,6 +90,10 @@ const registry = new SchemaRegistry({
 const schemaCache = new Map();
 
 // ── Functions ───────────────────────────────────────────────────────
+/**
+ * Verifies that the specified Kafka topic exists and has partitions
+ * @throws {Error} If topic doesn't exist or has no partitions
+ */
 async function verifyTopicExists() {
   const admin = kafka.admin();
   try {
@@ -67,6 +107,11 @@ async function verifyTopicExists() {
   }
 }
 
+/**
+ * Decodes an Avro message using the schema registry
+ * @param {Buffer} buffer - The message buffer to decode
+ * @returns {Promise<Object>} The decoded message
+ */
 async function decodeMessage(buffer) {
   const schemaId = buffer.slice(1, 5).readUInt32BE(0);
   const payload = buffer.slice(5);
@@ -81,6 +126,10 @@ async function decodeMessage(buffer) {
   return type.fromBuffer(payload);
 }
 
+/**
+ * Retrieves the latest message from the Kafka topic
+ * @throws {Error} If unable to retrieve the message
+ */
 async function getLatestMessage() {
   const admin = kafka.admin();
   let offsets;
@@ -108,15 +157,7 @@ async function getLatestMessage() {
   
   consumer = kafka.consumer({ 
     groupId: uniqueGroupId,
-    sessionTimeout: 30000,
-    rebalanceTimeout: 60000,
-    heartbeatInterval: 3000,
-    maxWaitTimeInMs: 60000,
-    retry: {
-      retries: 3,
-      initialRetryTime: 1000,
-      maxRetryTime: 30000
-    }
+    ...CONSUMER_CONFIG
   });
 
   let resolveMessage, rejectMessage;
@@ -184,7 +225,7 @@ async function getLatestMessage() {
       const error = new Error('Timeout waiting for message');
       console.error('❌ Consumer timeout:', error);
       rejectMessage(error);
-    }, 120000); // 2 minutes
+    }, MESSAGE_TIMEOUT);
 
     await gotOne;
     clearTimeout(timeout);
@@ -206,13 +247,25 @@ async function getLatestMessage() {
   }
 }
 
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 Received SIGTERM. Starting graceful shutdown...');
+  try {
+    // Add any cleanup logic here
+    process.exit(0);
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
 // ── Main ────────────────────────────────────────────────────────────
 (async () => {
   try {
     await verifyTopicExists();
     await getLatestMessage();
   } catch (error) {
-    console.error("❌ Fatal error:", error.message);
+    console.error("❌ Fatal error:", error.stack);
     process.exit(1);
   }
 })();
