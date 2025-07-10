@@ -1,4 +1,3 @@
-// index.js
 require("dotenv").config();
 
 const {
@@ -8,33 +7,67 @@ const {
   CompressionCodecs,
 } = require("kafkajs");
 const { SchemaRegistry } = require("@kafkajs/confluent-schema-registry");
-const avro    = require("avsc");
-const util    = require("util");
+const util = require("util");
+const Big = require("big.js");
 const SnappyCodec = require("kafkajs-snappy");
 
-// ─── REGISTER SNAPPY ─────────────────────────────────────────────────────────
-// This replaces KafkaJS’s built-in stub (which throws “not implemented”) with
-// the real Snappy codec from kafkajs-snappy. Do this before you create any
-// producer/consumer instances:
-
+// Register Snappy compression
 CompressionCodecs[CompressionTypes.Snappy] = SnappyCodec;
 
-// ── Constants ───────────────────────────────────────────────────────
+// ─── Decimal Decoder ────────────────────────────────────────────────
+
+function decodeAvroDecimal(buffer, scale = 2) {
+  if (!Buffer.isBuffer(buffer)) return null;
+  if (buffer.length === 0) return "0";
+
+  const isNegative = (buffer[0] & 0x80) !== 0;
+  const unsigned = isNegative ? twosComplement(buffer) : buffer;
+
+  const bigInt = BigInt("0x" + unsigned.toString("hex"));
+  const value = isNegative ? -bigInt : bigInt;
+
+  return new Big(value.toString()).div(Math.pow(10, scale)).toString();
+}
+
+function twosComplement(buf) {
+  const inverted = Buffer.from(buf.map((b) => ~b));
+  for (let i = inverted.length - 1; i >= 0; i--) {
+    if (++inverted[i] <= 0xff) break;
+  }
+  return inverted;
+}
+
+// Recursively decode all Buffer fields as decimals
+function decodeDecimalFields(obj, scale = 2) {
+  if (Array.isArray(obj)) {
+    return obj.map((item) => decodeDecimalFields(item, scale));
+  }
+  if (Buffer.isBuffer(obj)) {
+    return decodeAvroDecimal(obj, scale);
+  }
+  if (obj !== null && typeof obj === "object") {
+    return Object.fromEntries(
+      Object.entries(obj).map(([key, val]) => [
+        key,
+        decodeDecimalFields(val, scale),
+      ])
+    );
+  }
+  return obj;
+}
+
+// ─── Config & Setup ─────────────────────────────────────────────────
+
 const CONSUMER_CONFIG = {
   sessionTimeout: 30000,
   rebalanceTimeout: 60000,
   heartbeatInterval: 3000,
   maxWaitTimeInMs: 60000,
-  retry: {
-    retries: 3,
-    initialRetryTime: 1000,
-    maxRetryTime: 30000
-  }
+  retry: { retries: 3, initialRetryTime: 1000, maxRetryTime: 30000 },
 };
 
-const MESSAGE_TIMEOUT = 120000; // 2 minutes
+const MESSAGE_TIMEOUT = 120000;
 
-// ── Environment Setup ───────────────────────────────────────────────
 const required = {
   KAFKA_ENDPOINT: process.env.KAFKA_ENDPOINT?.trim(),
   KAFKA_SECRET: process.env.KAFKA_SECRET?.trim(),
@@ -46,118 +79,80 @@ const required = {
 };
 
 const missing = Object.entries(required)
-  .filter(([_, value]) => !value)
-  .map(([key]) => key);
-
+  .filter(([, v]) => !v)
+  .map(([k]) => k);
 if (missing.length > 0) {
-  console.error(`❌ Missing environment variables: ${missing.join(', ')}`);
+  console.error(`❌ Missing environment variables: ${missing.join(", ")}`);
   process.exit(1);
 }
 
-const { 
-  KAFKA_ENDPOINT: kafkaEndpoint,
-  KAFKA_SECRET: kafkaSecret,
-  KAFKA_KEY: kafkaKey,
-  KAFKA_TOPIC: kafkaTopic,
-  SCHEMA_REGISTRY_URL: schemaRegistryUrl,
-  SCHEMA_REGISTRY_KEY: schemaRegistryKey,
-  SCHEMA_REGISTRY_SECRET: schemaRegistrySecret
+const {
+  KAFKA_ENDPOINT,
+  KAFKA_SECRET,
+  KAFKA_KEY,
+  KAFKA_TOPIC,
+  SCHEMA_REGISTRY_URL,
+  SCHEMA_REGISTRY_KEY,
+  SCHEMA_REGISTRY_SECRET,
 } = required;
 
-// ── Clients ─────────────────────────────────────────────────────────
 const kafka = new Kafka({
   clientId: "latest-message-consumer",
-  brokers: [kafkaEndpoint],
+  brokers: [KAFKA_ENDPOINT],
   ssl: true,
-  sasl: {
-    mechanism: "plain",
-    username: kafkaKey,
-    password: kafkaSecret,
-  },
+  sasl: { mechanism: "plain", username: KAFKA_KEY, password: KAFKA_SECRET },
   connectionTimeout: 30000,
   requestTimeout: 30000,
   logLevel: logLevel.ERROR,
 });
 
 const registry = new SchemaRegistry({
-  host: schemaRegistryUrl,
-  auth: {
-    username: schemaRegistryKey,
-    password: schemaRegistrySecret,
-  },
+  host: SCHEMA_REGISTRY_URL,
+  auth: { username: SCHEMA_REGISTRY_KEY, password: SCHEMA_REGISTRY_SECRET },
 });
 
-const schemaCache = new Map();
+// ─── Kafka Helpers ─────────────────────────────────────────────────
 
-// ── Functions ───────────────────────────────────────────────────────
-/**
- * Verifies that the specified Kafka topic exists and has partitions
- * @throws {Error} If topic doesn't exist or has no partitions
- */
+async function decodeMessage(buffer) {
+  // Let the registry decode named types; decimals stay as Buffer
+  return registry.decode(buffer);
+}
+
 async function verifyTopicExists() {
   const admin = kafka.admin();
   try {
     await admin.connect();
-    const metadata = await admin.fetchTopicMetadata({ topics: [kafkaTopic] });
+    const metadata = await admin.fetchTopicMetadata({ topics: [KAFKA_TOPIC] });
     if (!metadata.topics.length || !metadata.topics[0].partitions.length) {
-      throw new Error(`Topic "${kafkaTopic}" not found or has no partitions.`);
+      throw new Error(`Topic "${KAFKA_TOPIC}" not found or has no partitions.`);
     }
   } finally {
     await admin.disconnect().catch(() => {});
   }
 }
 
-/**
- * Decodes an Avro message using the schema registry
- * @param {Buffer} buffer - The message buffer to decode
- * @returns {Promise<Object>} The decoded message
- */
-async function decodeMessage(buffer) {
-  const schemaId = buffer.slice(1, 5).readUInt32BE(0);
-  const payload = buffer.slice(5);
-
-  let type = schemaCache.get(schemaId);
-  if (!type) {
-    const { schema } = await registry.getSchema(schemaId);
-    type = avro.Type.forSchema(JSON.parse(schema));
-    schemaCache.set(schemaId, type);
-  }
-
-  return type.fromBuffer(payload);
-}
-
-/**
- * Retrieves the latest message from the Kafka topic
- * @throws {Error} If unable to retrieve the message
- */
 async function getLatestMessage() {
   const admin = kafka.admin();
   let offsets;
-  let consumer;
-
   try {
     await admin.connect();
-    offsets = await admin.fetchTopicOffsets(kafkaTopic);
-    console.log('🔍 Found topic offsets:', offsets);
+    offsets = await admin.fetchTopicOffsets(KAFKA_TOPIC);
+    console.log("🔍 Found topic offsets:", offsets);
   } finally {
     await admin.disconnect().catch(console.error);
   }
 
   const { partition, offset } = offsets.find((o) => o.partition === 0) || {};
-  if (!offset) {
-    throw new Error('No messages found in topic');
-  }
+  if (!offset) throw new Error("No messages found in topic");
 
-  const lastOffsetNum = Math.max(0, Number(offset) - 1);
-  const lastOffset = lastOffsetNum.toString();
+  const lastOffset = Math.max(0, Number(offset) - 1).toString();
   console.log(`📖 Attempting to read message at offset ${lastOffset}`);
 
-  // Generate unique group ID with timestamp and random string
-  const uniqueGroupId = `latest-message-group-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-  
-  consumer = kafka.consumer({ 
-    groupId: uniqueGroupId,
-    ...CONSUMER_CONFIG
+  const consumer = kafka.consumer({
+    groupId: `latest-message-group-${Date.now()}-${Math.random()
+      .toString(36)
+      .substring(7)}`,
+    ...CONSUMER_CONFIG,
   });
 
   let resolveMessage, rejectMessage;
@@ -168,39 +163,25 @@ async function getLatestMessage() {
 
   try {
     await consumer.connect();
-    console.log('✅ Consumer connected');
-
-    // Subscribe before setting up the group join handler
-    await consumer.subscribe({ topic: kafkaTopic, fromBeginning: false });
+    await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
 
     consumer.on(consumer.events.GROUP_JOIN, async () => {
-      try {
-        console.log(`🎯 Seeking to offset ${lastOffset}`);
-        await consumer.seek({ topic: kafkaTopic, partition, offset: lastOffset });
-      } catch (err) {
-        console.error('❌ Seek error:', err);
-        rejectMessage(err);
-      }
-    });
-
-    // Add connection error handler
-    consumer.on(consumer.events.CONNECT, () => {
-      console.log('📡 Consumer reconnected');
-    });
-
-    // Add disconnect handler
-    consumer.on(consumer.events.DISCONNECT, () => {
-      console.log('🔌 Consumer disconnected');
+      await consumer.seek({
+        topic: KAFKA_TOPIC,
+        partition,
+        offset: lastOffset,
+      });
     });
 
     await consumer.run({
       eachMessage: async ({ topic, partition: p, message }) => {
-        let decoded;
+        let decodedWithDecimals;
         try {
-          decoded = await registry.decode(message.value);
-        } catch (decodeErr) {
-          console.error("❌ Failed to decode Avro message:", decodeErr.message);
-          decoded = { raw: message.value.toString("base64") };
+          const decodedRaw = await decodeMessage(message.value);
+          decodedWithDecimals = decodeDecimalFields(decodedRaw, 2);
+        } catch (err) {
+          console.error("❌ Failed to decode Avro message:", err.stack || err);
+          decodedWithDecimals = { raw: message.value.toString("base64") };
         }
 
         console.log(
@@ -210,62 +191,42 @@ async function getLatestMessage() {
               topic,
               partition: p,
               offset: message.offset,
-              decoded,
+              decoded: decodedWithDecimals,
             },
             { depth: null, colors: true }
           )
         );
 
         resolveMessage();
-      }
+      },
     });
 
-    // Increase timeout to 2 minutes
-    const timeout = setTimeout(() => {
-      const error = new Error('Timeout waiting for message');
-      console.error('❌ Consumer timeout:', error);
-      rejectMessage(error);
-    }, MESSAGE_TIMEOUT);
-
+    const timeout = setTimeout(
+      () => rejectMessage(new Error("Timeout waiting for message")),
+      MESSAGE_TIMEOUT
+    );
     await gotOne;
     clearTimeout(timeout);
-
-  } catch (error) {
-    console.error('❌ Consumer error:', error);
-    throw error;
   } finally {
-    if (consumer) {
-      try {
-        // Leave the consumer group before disconnecting
-        await consumer.stop();
-        await consumer.disconnect();
-        console.log('👋 Consumer cleanup completed');
-      } catch (error) {
-        console.error('❌ Error during consumer cleanup:', error);
-      }
-    }
+    await consumer.stop();
+    await consumer.disconnect();
+    console.log("👋 Consumer cleanup completed");
   }
 }
 
-// Handle graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('🛑 Received SIGTERM. Starting graceful shutdown...');
-  try {
-    // Add any cleanup logic here
-    process.exit(0);
-  } catch (error) {
-    console.error('❌ Error during shutdown:', error);
-    process.exit(1);
-  }
+// ─── Entrypoint ─────────────────────────────────────────────────────
+
+process.on("SIGTERM", async () => {
+  console.log("🛑 Received SIGTERM. Shutting down...");
+  process.exit(0);
 });
 
-// ── Main ────────────────────────────────────────────────────────────
 (async () => {
   try {
     await verifyTopicExists();
     await getLatestMessage();
   } catch (error) {
-    console.error("❌ Fatal error:", error.stack);
+    console.error("❌ Fatal error:", error.stack || error.message);
     process.exit(1);
   }
 })();
